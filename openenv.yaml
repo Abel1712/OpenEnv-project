@@ -1,0 +1,24 @@
+name: code-review-env
+version: 0.1.0
+description: "AI agent reviews pull requests: detects bugs, suggests fixes, assigns scores"
+author: AbelJames
+tags:
+  - openenv
+  - code-review
+  - software-engineering
+  - security
+entry_point: server/app.py
+port: 7860
+tasks:
+  - id: task_1
+    name: "Style & Formatting Review"
+    difficulty: easy
+    max_steps: 30
+  - id: task_2
+    name: "Logic Bug Detection"
+    difficulty: medium
+    max_steps: 40
+  - id: task_3
+    name: "Security Vulnerability Audit"
+    difficulty: hard
+    max_steps: 50

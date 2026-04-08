@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Read(//c/Users/nancyjames/Desktop/Meta_project_openEnv/$\\(pwd\\)/**)",
+      "Read(//c/Users/nancyjames/Desktop/Meta_project_openEnv/$\\(pwd\\)/tests/**)",
+      "Read(//c/Users/nancyjames/.claude/**)",
+      "Bash(py -m pytest --version)",
+      "Bash(pip install:*)",
+      "Bash(PYTHONPATH=. uv run pytest tests/test_graders.py -v --tb=short)",
+      "Bash(pip show:*)"
+    ]
+  }
+}
