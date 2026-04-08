@@ -7,7 +7,7 @@ import asyncio
 import os
 import textwrap
 import json
-from typing import List, Optional
+from typing import List, Optional, Set, Dict
 
 from openai import OpenAI
 from client import CodeReviewEnvClient
@@ -18,10 +18,11 @@ IMAGE_NAME   = os.getenv("LOCAL_IMAGE_NAME")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
+ENV_URL      = os.getenv("ENV_URL", "https://abeljames-code-review-env.hf.space")
 BENCHMARK    = "code-review-env"
 MAX_STEPS    = 30
 TEMPERATURE  = 0.7
-MAX_TOKENS   = 600
+MAX_TOKENS   = 900           # FIX 1: was 600 — too tight for comment+summary JSON
 SUCCESS_SCORE_THRESHOLD = 0.3
 TASKS        = ["task_1", "task_2", "task_3"]
 
@@ -62,24 +63,52 @@ SYSTEM_PROMPT = textwrap.dedent("""
       {"action_type": "assign_score",  "score": 7.5, "summary": "Overall review summary"}
 
     Review strategy:
-    1. Call get_diff first to see what changed.
-    2. read_file for each changed file.
-    3. post_comment for every issue found (include file, exact line number, explanation).
-    4. assign_score when done reviewing (0=block merge, 10=approve without changes).
+    1. get_diff — see what changed, note exact line numbers shown in the diff.
+    2. read_file — read each changed file ONCE to confirm exact line numbers (line 1 = first line of file).
+    3. post_comment — ONLY comment on lines you have SEEN in file output. Use the EXACT
+       line number from the file content. Never guess. Each comment must reference a real
+       issue on that specific line.
+    4. assign_score — call this after posting all comments. Score guide:
+       0-3: block merge (security/critical), 4-6: needs changes, 7-10: approve.
 
-    Respond ONLY with a JSON object — no explanation, no markdown.
+    CRITICAL RULES:
+    - Never read a file you have already read — check "Files already read" before read_file.
+    - Never post duplicate comments on the same file+line.
+    - Never post a comment unless you have READ the file and confirmed the issue on that line.
+    - Call assign_score within 15 steps — do not loop forever.
+    - Respond ONLY with a JSON object — no explanation, no markdown fences.
 """).strip()
 
 
-def build_user_prompt(step: int, obs: dict, history: List[str]) -> str:
-    history_block = "\n".join(history[-4:]) if history else "None"
+def build_user_prompt(
+    step: int,
+    obs: dict,
+    history: List[str],
+    files_read: Set[str],
+    comments_posted: Set[str],
+) -> str:
+    history_block = "\n".join(history[-6:]) if history else "None"
+    steps_left = MAX_STEPS - step
+    urgency = " — CALL assign_score NOW" if steps_left <= 3 else (
+              " — wrap up and assign_score soon" if steps_left <= 8 else "")
+
+    # FIX 2: Raise truncation limit so model sees enough content to identify real line numbers
+    action_result = obs.get('action_result', '')
+    action_result_preview = action_result[:2500] if len(action_result) > 2500 else action_result
+
+    # FIX 3: Expose files_read and comments_posted so model avoids re-reads and duplicates
+    files_read_str    = ", ".join(sorted(files_read))    if files_read    else "none"
+    comments_str      = ", ".join(sorted(comments_posted)) if comments_posted else "none"
+
     return textwrap.dedent(f"""
-        Step: {step}
+        Step: {step}/{MAX_STEPS} (steps remaining: {steps_left}{urgency})
         Task: {obs.get('info', {}).get('task_id', 'unknown')}
         PR Title: {obs.get('pr_metadata', {}).get('title', 'Unknown')}
         Changed files: {obs.get('pr_metadata', {}).get('changed_files', [])}
+        Files already read (do NOT re-read these): {files_read_str}
+        Comments already posted (file:line — do NOT duplicate): {comments_str}
         Last action result:
-        {obs.get('action_result', '')[:800]}
+        {action_result_preview}
         Review progress: {obs.get('review_progress', {})}
         Previous steps:
         {history_block}
@@ -87,8 +116,15 @@ def build_user_prompt(step: int, obs: dict, history: List[str]) -> str:
     """).strip()
 
 
-def get_next_action(client: OpenAI, step: int, obs: dict, history: List[str]) -> Action:
-    user_prompt = build_user_prompt(step, obs, history)
+def get_next_action(
+    client: OpenAI,
+    step: int,
+    obs: dict,
+    history: List[str],
+    files_read: Set[str],
+    comments_posted: Set[str],
+) -> Action:
+    user_prompt = build_user_prompt(step, obs, history, files_read, comments_posted)
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -101,7 +137,12 @@ def get_next_action(client: OpenAI, step: int, obs: dict, history: List[str]) ->
             stream=False,
         )
         raw = (completion.choices[0].message.content or "").strip()
-        raw = raw.strip("```json").strip("```").strip()
+        # FIX 4: More robust JSON fence stripping (handles ```json\n...\n``` cleanly)
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
         data = json.loads(raw)
         return Action(**data)
     except Exception as exc:
@@ -112,10 +153,12 @@ def get_next_action(client: OpenAI, step: int, obs: dict, history: List[str]) ->
 # ── Per-task runner ───────────────────────────────────────────────────────────
 
 async def run_task(client: OpenAI, task_id: str) -> None:
-    env = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
+    env = CodeReviewEnvClient(base_url=ENV_URL)
 
-    history: List[str] = []
-    rewards: List[float] = []
+    history: List[str]          = []
+    rewards: List[float]        = []
+    files_read: Set[str]        = set()   # FIX: track to prevent re-reads
+    comments_posted: Set[str]   = set()   # FIX: track to prevent duplicate comments
     steps_taken = 0
     score   = 0.0
     success = False
@@ -130,7 +173,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             if result.done:
                 break
 
-            action = get_next_action(client, step, obs, history)
+            action = get_next_action(client, step, obs, history, files_read, comments_posted)
             result = await env.step(action)
             obs    = result.observation.model_dump()
 
@@ -143,7 +186,25 @@ async def run_task(client: OpenAI, task_id: str) -> None:
 
             log_step(step=step, action=action.action_type, reward=reward, done=done, error=error)
 
-            history.append(f"Step {step}: {action.action_type!r} -> reward {reward:+.2f}")
+            # FIX: Track read files to stop 0-reward re-read loops
+            if action.action_type == ActionType.READ_FILE and action.file_path:
+                files_read.add(action.file_path)
+
+            # FIX: Track posted comments to stop duplicate penalties
+            if action.action_type == ActionType.POST_COMMENT and action.file_path and action.line_number:
+                comments_posted.add(f"{action.file_path}:{action.line_number}")
+
+            # FIX: Richer history — include file/line so model remembers what it saw
+            detail = ""
+            if action.file_path:
+                detail += f" file={action.file_path}"
+            if action.line_number:
+                detail += f" line={action.line_number}"
+            if action.comment:
+                detail += f" comment='{action.comment[:60]}'"
+            history.append(
+                f"Step {step}: {action.action_type!r}{detail} -> reward {reward:+.2f}"
+            )
 
             if done:
                 score = obs.get("info", {}).get("grader_score", 0.0)
