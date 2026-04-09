@@ -126,7 +126,12 @@ class CodeReviewEnvironment(Environment[Action, Observation, CodeReviewState]):
         if path not in self._state.files_read:
             self._state.files_read.append(path)
 
-        return files[path], reward
+        # Include line numbers so the agent can post comments on exact lines
+        raw = files[path]
+        numbered = "\n".join(
+            f"{i:4}: {line}" for i, line in enumerate(raw.splitlines(), start=1)
+        )
+        return numbered, reward
 
     def _handle_get_diff(self, action: Action):
         diff = self._state.pr_data.get("diff", "")

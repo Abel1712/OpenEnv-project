@@ -251,7 +251,7 @@ index 0000000..3333333 100644
             },
             {
                 "file": "src/cache/lru_cache.js",
-                "line": 10,
+                "line": 11,
                 "type": "edge_case",
                 "severity": "low",
                 "bug_type": "edge_case",
@@ -391,7 +391,7 @@ index 0000000..4444444 100644
             },
             {
                 "file": "api/export.py",
-                "line": 27,
+                "line": 28,
                 "type": "path_traversal",
                 "severity": "HIGH",
                 "bug_type": "path_traversal",
