@@ -153,19 +153,25 @@ def get_next_action(
 # ── Per-task runner ───────────────────────────────────────────────────────────
 
 async def run_task(client: OpenAI, task_id: str) -> None:
-    env = CodeReviewEnvClient(base_url=ENV_URL)
-
     history: List[str]          = []
     rewards: List[float]        = []
-    files_read: Set[str]        = set()   # FIX: track to prevent re-reads
-    comments_posted: Set[str]   = set()   # FIX: track to prevent duplicate comments
+    files_read: Set[str]        = set()
+    comments_posted: Set[str]   = set()
     steps_taken = 0
     score   = 0.0
     success = False
+    env     = None
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
+        # Use local Docker image when validator provides LOCAL_IMAGE_NAME;
+        # fall back to the hosted HF Space URL otherwise.
+        if IMAGE_NAME:
+            env = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
+        else:
+            env = CodeReviewEnvClient(base_url=ENV_URL)
+
         result = await env.reset(episode_id=task_id)
         obs    = result.observation.model_dump()
 
@@ -186,15 +192,12 @@ async def run_task(client: OpenAI, task_id: str) -> None:
 
             log_step(step=step, action=action.action_type, reward=reward, done=done, error=error)
 
-            # FIX: Track read files to stop 0-reward re-read loops
             if action.action_type == ActionType.READ_FILE and action.file_path:
                 files_read.add(action.file_path)
 
-            # FIX: Track posted comments to stop duplicate penalties
             if action.action_type == ActionType.POST_COMMENT and action.file_path and action.line_number:
                 comments_posted.add(f"{action.file_path}:{action.line_number}")
 
-            # FIX: Richer history — include file/line so model remembers what it saw
             detail = ""
             if action.file_path:
                 detail += f" file={action.file_path}"
@@ -213,11 +216,15 @@ async def run_task(client: OpenAI, task_id: str) -> None:
         score   = float(min(max(score, 0.0), 1.0))
         success = score >= SUCCESS_SCORE_THRESHOLD
 
+    except Exception as exc:
+        print(f"[DEBUG] run_task({task_id}) error: {exc}", flush=True)
+
     finally:
-        try:
-            await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error: {e}", flush=True)
+        if env is not None:
+            try:
+                await env.close()
+            except Exception as e:
+                print(f"[DEBUG] env.close() error: {e}", flush=True)
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
@@ -226,7 +233,10 @@ async def run_task(client: OpenAI, task_id: str) -> None:
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     for task_id in TASKS:
-        await run_task(client, task_id)
+        try:
+            await run_task(client, task_id)
+        except Exception as exc:
+            print(f"[DEBUG] Unhandled error for {task_id}: {exc}", flush=True)
 
 
 if __name__ == "__main__":

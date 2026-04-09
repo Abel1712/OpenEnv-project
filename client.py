@@ -16,12 +16,14 @@ class CodeReviewEnvClient(EnvClient[Action, Observation, CodeReviewState]):
         return action.model_dump(exclude_none=True)
 
     def _parse_result(self, payload: dict) -> StepResult[Observation]:
-        obs = Observation(**payload["observation"])
-        return StepResult(
-            observation=obs,
-            reward=obs.reward,
-            done=obs.done,
-        )
+        obs_data = payload.get("observation", {})
+        obs_data.setdefault("reward", 0.0)
+        obs_data.setdefault("done", False)
+        obs = Observation(**obs_data)
+        # Prefer top-level done/reward if present (some openenv versions put them there)
+        done   = payload.get("done",   obs.done)
+        reward = payload.get("reward", obs.reward)
+        return StepResult(observation=obs, reward=reward, done=done)
 
     def _parse_state(self, payload: dict) -> CodeReviewState:
         return CodeReviewState(**payload)

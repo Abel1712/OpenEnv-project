@@ -26,8 +26,8 @@ class Observation(BaseModel):
     action_result:   str
     pr_metadata:     dict
     review_progress: dict
-    reward:          float
-    done:            bool
+    reward:          float = 0.0
+    done:            bool  = False
     info:            dict
 
 

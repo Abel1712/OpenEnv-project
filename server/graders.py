@@ -30,10 +30,21 @@ def grade_style_review(state) -> float:
     return float(max(0.0, min(1.0, score)))
 
 
+def _get_assigned_score(state):
+    """Extract assigned_score from either state.assigned_score (CodeReviewState)
+    or state.info dict (SimpleNamespace used in tests)."""
+    score = getattr(state, "assigned_score", None)
+    if score is None:
+        info = getattr(state, "info", {}) or {}
+        score = info.get("assigned_score")
+    return score
+
+
 def grade_logic_bugs(state) -> float:
     ground_truth = state.ground_truth_issues
     comments = state.comments
-    info = state.info if hasattr(state, "info") else {}
+    assigned_score_val = _get_assigned_score(state)
+    info = {"assigned_score": assigned_score_val} if assigned_score_val is not None else {}
 
     bug_weights = {
         "off_by_one": 0.25,
@@ -79,7 +90,8 @@ def grade_logic_bugs(state) -> float:
 def grade_security_audit(state) -> float:
     ground_truth = state.ground_truth_issues
     comments = state.comments
-    info = state.info if hasattr(state, "info") else {}
+    assigned_score_val = _get_assigned_score(state)
+    info = {"assigned_score": assigned_score_val} if assigned_score_val is not None else {}
 
     vuln_weights = {
         "sql_injection": 0.25,
