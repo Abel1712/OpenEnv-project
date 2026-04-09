@@ -145,6 +145,7 @@ def get_next_action(
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,
+            timeout=60,
         )
         raw = (completion.choices[0].message.content or "").strip()
         # FIX 4: More robust JSON fence stripping (handles ```json\n...\n``` cleanly)
@@ -198,6 +199,21 @@ async def run_task(client: OpenAI, task_id: str) -> None:
                 )
             else:
                 action = get_next_action(client, step, obs, history, files_read, comments_posted)
+
+            # Hard block: override premature assign_score in code, not just via prompt hint.
+            # If the LLM ignores instructions and scores before doing any work, redirect it.
+            if action.action_type == ActionType.ASSIGN_SCORE and step < MAX_STEPS:
+                if not files_read:
+                    # Haven't read any file yet — force read of first changed file
+                    changed = obs.get("pr_metadata", {}).get("changed_files", [])
+                    fallback_file = changed[0] if changed else None
+                    action = Action(action_type=ActionType.READ_FILE, file_path=fallback_file)
+                    print(f"[DEBUG] Blocked premature assign_score (no files read); redirected to read_file {fallback_file}", flush=True)
+                elif not comments_posted:
+                    # Read files but posted no comments yet — force get_diff to keep reviewing
+                    action = Action(action_type=ActionType.GET_DIFF)
+                    print("[DEBUG] Blocked premature assign_score (no comments posted); redirected to get_diff", flush=True)
+
             result = await env.step(action)
             obs    = result.observation.model_dump()
 
