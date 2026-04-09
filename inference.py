@@ -20,7 +20,7 @@ API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
 ENV_URL      = os.getenv("ENV_URL", "https://abeljames-code-review-env.hf.space")
 BENCHMARK    = "code-review-env"
-MAX_STEPS    = 30
+MAX_STEPS    = 20          # 3 tasks × 20 steps × ~10s/call ≈ 10 min — safely under 20 min limit
 TEMPERATURE  = 0.7
 MAX_TOKENS   = 900           # FIX 1: was 600 — too tight for comment+summary JSON
 SUCCESS_SCORE_THRESHOLD = 0.3
@@ -89,8 +89,8 @@ def build_user_prompt(
 ) -> str:
     history_block = "\n".join(history[-6:]) if history else "None"
     steps_left = MAX_STEPS - step
-    urgency = " — CALL assign_score NOW" if steps_left <= 3 else (
-              " — wrap up and assign_score soon" if steps_left <= 8 else "")
+    urgency = " — CALL assign_score NOW" if steps_left <= 2 else (
+              " — finish comments and call assign_score soon" if steps_left <= 6 else "")
 
     # FIX 2: Raise truncation limit so model sees enough content to identify real line numbers
     action_result = obs.get('action_result', '')
@@ -190,7 +190,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             rewards.append(reward)
             steps_taken = step
 
-            log_step(step=step, action=action.action_type, reward=reward, done=done, error=error)
+            log_step(step=step, action=action.action_type.value, reward=reward, done=done, error=error)
 
             if action.action_type == ActionType.READ_FILE and action.file_path:
                 files_read.add(action.file_path)
@@ -206,12 +206,16 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             if action.comment:
                 detail += f" comment='{action.comment[:60]}'"
             history.append(
-                f"Step {step}: {action.action_type!r}{detail} -> reward {reward:+.2f}"
+                f"Step {step}: {action.action_type.value}{detail} -> reward {reward:+.2f}"
             )
 
             if done:
                 score = obs.get("info", {}).get("grader_score", 0.0)
                 break
+
+        # Fallback: if done was never True, try to read grader_score from final obs
+        if score == 0.0:
+            score = float(obs.get("info", {}).get("grader_score", 0.0))
 
         score   = float(min(max(score, 0.0), 1.0))
         success = score >= SUCCESS_SCORE_THRESHOLD
