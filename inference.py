@@ -75,7 +75,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - Never read a file you have already read — check "Files already read" before read_file.
     - Never post duplicate comments on the same file+line.
     - Never post a comment unless you have READ the file and confirmed the issue on that line.
-    - Call assign_score within 15 steps — do not loop forever.
+    - Do NOT call assign_score until you have read at least 1 file AND posted at least 1 comment.
+    - Call assign_score by step 15 at the latest — do not exhaust all steps without scoring.
     - Respond ONLY with a JSON object — no explanation, no markdown fences.
 """).strip()
 
@@ -89,8 +90,17 @@ def build_user_prompt(
 ) -> str:
     history_block = "\n".join(history[-6:]) if history else "None"
     steps_left = MAX_STEPS - step
-    urgency = " — CALL assign_score NOW" if steps_left <= 2 else (
-              " — finish comments and call assign_score soon" if steps_left <= 6 else "")
+
+    # Block assign_score until the agent has done at least some real work
+    ready_to_score = len(files_read) >= 1 and len(comments_posted) >= 1
+    if not ready_to_score:
+        urgency = " — read files and post comments first; do NOT call assign_score yet"
+    elif steps_left <= 2:
+        urgency = " — CALL assign_score NOW"
+    elif steps_left <= 6:
+        urgency = " — finish comments and call assign_score soon"
+    else:
+        urgency = ""
 
     # FIX 2: Raise truncation limit so model sees enough content to identify real line numbers
     action_result = obs.get('action_result', '')
@@ -179,7 +189,15 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             if result.done:
                 break
 
-            action = get_next_action(client, step, obs, history, files_read, comments_posted)
+            # Last step safety net: force assign_score so grader always runs
+            if step == MAX_STEPS:
+                action = Action(
+                    action_type=ActionType.ASSIGN_SCORE,
+                    score=5.0,
+                    summary="Review complete — forced score at step limit",
+                )
+            else:
+                action = get_next_action(client, step, obs, history, files_read, comments_posted)
             result = await env.step(action)
             obs    = result.observation.model_dump()
 
