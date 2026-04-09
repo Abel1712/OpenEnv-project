@@ -235,7 +235,16 @@ async def run_task(client: OpenAI, task_id: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    try:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    except Exception as exc:
+        # Emit [START]+[END] for every task so the validator never sees missing lines
+        for task_id in TASKS:
+            log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+            print(f"[DEBUG] OpenAI client init failed: {exc}", flush=True)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+        return
+
     for task_id in TASKS:
         try:
             await run_task(client, task_id)
