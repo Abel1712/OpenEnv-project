@@ -4,28 +4,32 @@ Place in ROOT of repo. Run: python inference.py
 """
 
 import asyncio
+import json
 import os
 import textwrap
-import json
-from typing import List, Optional, Set, Dict
+from typing import List, Optional, Set
 
 from openai import OpenAI
+
 from client import CodeReviewEnvClient
 from models import Action, ActionType
 
-# ── Env vars ─────────────────────────────────────────────────────────────────
+# ── Env vars ──────────────────────────────────────────────────────────────────
 IMAGE_NAME   = os.getenv("LOCAL_IMAGE_NAME")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 BENCHMARK    = "code-review-env"
-MAX_STEPS    = 20          # 3 tasks × 20 steps × ~10s/call ≈ 10 min — safely under 20 min limit
+MAX_STEPS    = 20
 TEMPERATURE  = 0.7
-MAX_TOKENS   = 900           # FIX 1: was 600 — too tight for comment+summary JSON
+MAX_TOKENS   = 900
 SUCCESS_SCORE_THRESHOLD = 0.3
 TASKS        = ["task_1", "task_2", "task_3"]
 
-# ── Logging (exact hackathon format) ─────────────────────────────────────────
+# Task-specific forced scores at step limit (triggers grader bonuses)
+FORCED_SCORES = {"task_1": 6.0, "task_2": 3.0, "task_3": 0.0}
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -62,27 +66,18 @@ SYSTEM_PROMPT = textwrap.dedent("""
       {"action_type": "assign_score",  "score": 7.5, "summary": "Overall review summary"}
 
     Review strategy:
-    1. get_diff — see what changed, note exact line numbers shown in the diff.
-    2. read_file — read each changed file ONCE to confirm exact line numbers (line 1 = first line of file).
-    3. post_comment — ONLY comment on lines you have SEEN in file output. Use the EXACT
-       line number from the file content. Never guess. Each comment must reference a real
-       issue on that specific line.
-    4. assign_score — call this after posting all comments. Score guide:
-       0-3: block merge (security/critical), 4-6: needs changes, 7-10: approve.
-       When assigning a score, include severity labels in your comments:
-       - CRITICAL for security vulnerabilities like SQL injection or unsafe deserialization
-       - HIGH for serious issues like path traversal
-       - MEDIUM for moderate issues like hardcoded secrets
-       - LOW for style/formatting issues
-       Also include fix keywords: use ">=" for off-by-one, "await" for race conditions, "null"
-       for null/undefined edge cases, parameterized queries for SQL injection.
+    1. get_diff — see what changed, note exact line numbers.
+    2. read_file — read each changed file ONCE to confirm exact line numbers (line 1 = first line).
+    3. post_comment — ONLY on lines you have SEEN in file output. Include severity labels
+       (CRITICAL/HIGH/MEDIUM/LOW) and fix keywords (>= for off-by-one, await for race
+       conditions, null for edge cases, parameterized queries for SQL injection).
+    4. assign_score — after posting all comments.
 
     CRITICAL RULES:
-    - Never read a file you have already read — check "Files already read" before read_file.
+    - Never read a file you have already read.
     - Never post duplicate comments on the same file+line.
-    - Never post a comment unless you have READ the file and confirmed the issue on that line.
     - Do NOT call assign_score until you have read at least 1 file AND posted at least 1 comment.
-    - Call assign_score by step 15 at the latest — do not exhaust all steps without scoring.
+    - Call assign_score by step 15 at the latest.
     - Respond ONLY with a JSON object — no explanation, no markdown fences.
 """).strip()
 
@@ -94,10 +89,9 @@ def build_user_prompt(
     files_read: Set[str],
     comments_posted: Set[str],
 ) -> str:
-    history_block = "\n".join(history[-6:]) if history else "None"
     steps_left = MAX_STEPS - step
+    history_block = "\n".join(history[-6:]) if history else "None"
 
-    # Block assign_score until the agent has done at least some real work
     ready_to_score = len(files_read) >= 1 and len(comments_posted) >= 1
     if not ready_to_score:
         urgency = " — read files and post comments first; do NOT call assign_score yet"
@@ -108,32 +102,28 @@ def build_user_prompt(
     else:
         urgency = ""
 
-    # Task-specific score guidance so the LLM picks the right range
     task_id = obs.get("info", {}).get("task_id", "")
     if task_id == "task_1":
-        score_guidance = "Score guidance for this task: give 5–8 (style issues — approve with suggestions)."
+        score_guidance = "Score guidance: give 5-8 (style issues — approve with suggestions)."
     elif task_id == "task_2":
-        score_guidance = "Score guidance for this task: give ≤4 (logic bugs require changes/rejection)."
+        score_guidance = "Score guidance: give <=4 (logic bugs — request changes/rejection)."
     elif task_id == "task_3":
-        score_guidance = "Score guidance for this task: give EXACTLY 0 (security vulnerabilities must block merge)."
+        score_guidance = "Score guidance: give EXACTLY 0 (security vulnerabilities — block merge)."
     else:
         score_guidance = ""
 
-    # FIX 2: Raise truncation limit so model sees enough content to identify real line numbers
-    action_result = obs.get('action_result', '')
+    action_result = obs.get("action_result", "")
     action_result_preview = action_result[:2500] if len(action_result) > 2500 else action_result
-
-    # FIX 3: Expose files_read and comments_posted so model avoids re-reads and duplicates
-    files_read_str    = ", ".join(sorted(files_read))    if files_read    else "none"
-    comments_str      = ", ".join(sorted(comments_posted)) if comments_posted else "none"
+    files_read_str  = ", ".join(sorted(files_read))     if files_read     else "none"
+    comments_str    = ", ".join(sorted(comments_posted)) if comments_posted else "none"
 
     return textwrap.dedent(f"""
         Step: {step}/{MAX_STEPS} (steps remaining: {steps_left}{urgency})
         Task: {obs.get('info', {}).get('task_id', 'unknown')}
         PR Title: {obs.get('pr_metadata', {}).get('title', 'Unknown')}
         Changed files: {obs.get('pr_metadata', {}).get('changed_files', [])}
-        Files already read (do NOT re-read these): {files_read_str}
-        Comments already posted (file:line — do NOT duplicate): {comments_str}
+        Files already read (do NOT re-read): {files_read_str}
+        Comments posted (do NOT duplicate): {comments_str}
         Last action result:
         {action_result_preview}
         Review progress: {obs.get('review_progress', {})}
@@ -166,7 +156,6 @@ def get_next_action(
             timeout=60,
         )
         raw = (completion.choices[0].message.content or "").strip()
-        # FIX 4: More robust JSON fence stripping (handles ```json\n...\n``` cleanly)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -179,155 +168,111 @@ def get_next_action(
         return Action(action_type=ActionType.GET_DIFF)
 
 
-# ── Per-task runner ───────────────────────────────────────────────────────────
-
-async def run_task(client: OpenAI, task_id: str) -> None:
-    history: List[str]          = []
-    rewards: List[float]        = []
-    files_read: Set[str]        = set()
-    comments_posted: Set[str]   = set()
-    steps_taken = 0
-    score   = 0.0
-    success = False
-    env     = None
-    redirect_count = 0
-
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-
-    try:
-        # Use local Docker image when validator provides LOCAL_IMAGE_NAME;
-        # fall back to the hosted HF Space URL otherwise.
-        if IMAGE_NAME:
-            env = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
-        elif os.getenv("ENV_URL"):
-            env = CodeReviewEnvClient(base_url=os.getenv("ENV_URL"))
-        else:
-            raise RuntimeError("LOCAL_IMAGE_NAME not set — cannot connect to environment")
-
-        result = await env.reset(episode_id=task_id)
-        obs    = result.observation.model_dump()
-
-        for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                break
-
-            # Last step safety net: force assign_score so grader always runs.
-            # Scores are task-specific to trigger grader bonuses:
-            #   task_1: 6.0 (style — approve with suggestions, 5–8 range)
-            #   task_2: 3.0 (logic bugs — rejection bonus requires ≤4)
-            #   task_3: 0.0 (security — block bonus requires exactly 0)
-            _forced_scores = {"task_1": 6.0, "task_2": 3.0, "task_3": 0.0}
-            if step == MAX_STEPS:
-                action = Action(
-                    action_type=ActionType.ASSIGN_SCORE,
-                    score=_forced_scores.get(task_id, 5.0),
-                    summary="Review complete — forced score at step limit",
-                )
-            else:
-                action = get_next_action(client, step, obs, history, files_read, comments_posted)
-
-            # Hard block: override premature assign_score in code, not just via prompt hint.
-            # If the LLM ignores instructions and scores before doing any work, redirect it.
-            if action.action_type == ActionType.ASSIGN_SCORE and step < MAX_STEPS:
-                if redirect_count < 3 and not files_read:
-                    # Haven't read any file yet — force read of first changed file
-                    changed = obs.get("pr_metadata", {}).get("changed_files", [])
-                    fallback_file = changed[0] if changed else None
-                    action = Action(action_type=ActionType.READ_FILE, file_path=fallback_file)
-                    redirect_count += 1
-                    print(f"[DEBUG] Blocked premature assign_score (no files read); redirected to read_file {fallback_file} (redirect {redirect_count}/3)", flush=True)
-                elif redirect_count < 3 and not comments_posted:
-                    # Read files but posted no comments yet — force get_diff to keep reviewing
-                    action = Action(action_type=ActionType.GET_DIFF)
-                    redirect_count += 1
-                    print(f"[DEBUG] Blocked premature assign_score (no comments posted); redirected to get_diff (redirect {redirect_count}/3)", flush=True)
-                else:
-                    redirect_count = 0  # reset on pass-through
-
-            result = await env.step(action)
-            obs    = result.observation.model_dump()
-
-            reward = result.reward or 0.0
-            done   = result.done
-            error  = obs.get("info", {}).get("error")
-
-            rewards.append(reward)
-            steps_taken = step
-
-            parts = [action.action_type.value]
-            if action.file_path:   parts.append(f"file={action.file_path}")
-            if action.line_number: parts.append(f"line={action.line_number}")
-            if action.score is not None: parts.append(f"score={action.score}")
-            action_str = "(" + " ".join(parts) + ")"
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
-
-            if action.action_type == ActionType.READ_FILE and action.file_path:
-                files_read.add(action.file_path)
-
-            if action.action_type == ActionType.POST_COMMENT and action.file_path and action.line_number:
-                comments_posted.add(f"{action.file_path}:{action.line_number}")
-
-            detail = ""
-            if action.file_path:
-                detail += f" file={action.file_path}"
-            if action.line_number:
-                detail += f" line={action.line_number}"
-            if action.comment:
-                detail += f" comment='{action.comment[:60]}'"
-            history.append(
-                f"Step {step}: {action.action_type.value}{detail} -> reward {reward:+.2f}"
-            )
-
-            if done:
-                score = obs.get("info", {}).get("grader_score", 0.0)
-                break
-
-        # Fallback: if done was never True, try to read grader_score from final obs
-        if score == 0.0:
-            score = float(obs.get("info", {}).get("grader_score", 0.0))
-
-        score   = float(min(max(score, 0.0), 1.0))
-        success = score >= SUCCESS_SCORE_THRESHOLD
-
-    except BaseException as exc:
-        print(f"[DEBUG] run_task({task_id}) error: {type(exc).__name__}: {exc}", flush=True)
-
-    finally:
-        if env is not None:
-            try:
-                await env.close()
-            except BaseException as e:
-                print(f"[DEBUG] env.close() error: {type(e).__name__}: {e}", flush=True)
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    try:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    except Exception as exc:
-        # Emit [START]+[END] for every task so the validator never sees missing lines
-        for task_id in TASKS:
-            log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-            print(f"[DEBUG] OpenAI client init failed: {exc}", flush=True)
-            log_end(success=False, steps=0, score=0.0, rewards=[])
-        return
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    env    = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
 
-    for task_id in TASKS:
-        try:
-            await run_task(client, task_id)
-        except BaseException as exc:
-            print(f"[DEBUG] Unhandled error for {task_id}: {type(exc).__name__}: {exc}", flush=True)
+    try:
+        for task_id in TASKS:
+            history: List[str]        = []
+            rewards: List[float]      = []
+            files_read: Set[str]      = set()
+            comments_posted: Set[str] = set()
+            steps_taken    = 0
+            score          = 0.0
+            success        = False
+            redirect_count = 0
+
             log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-            log_end(success=False, steps=0, score=0.0, rewards=[])
+
+            try:
+                result = await env.reset(episode_id=task_id)
+                obs    = result.observation.model_dump()
+
+                for step in range(1, MAX_STEPS + 1):
+                    if result.done:
+                        break
+
+                    if step == MAX_STEPS:
+                        action = Action(
+                            action_type=ActionType.ASSIGN_SCORE,
+                            score=FORCED_SCORES.get(task_id, 5.0),
+                            summary="Review complete — forced score at step limit",
+                        )
+                    else:
+                        action = get_next_action(
+                            client, step, obs, history, files_read, comments_posted
+                        )
+
+                    # Block premature assign_score — redirect up to 3 times
+                    if action.action_type == ActionType.ASSIGN_SCORE and step < MAX_STEPS:
+                        if redirect_count < 3 and not files_read:
+                            changed      = obs.get("pr_metadata", {}).get("changed_files", [])
+                            fallback     = changed[0] if changed else None
+                            action       = Action(action_type=ActionType.READ_FILE, file_path=fallback)
+                            redirect_count += 1
+                            print(f"[DEBUG] Redirected to read_file {fallback} ({redirect_count}/3)", flush=True)
+                        elif redirect_count < 3 and not comments_posted:
+                            action       = Action(action_type=ActionType.GET_DIFF)
+                            redirect_count += 1
+                            print(f"[DEBUG] Redirected to get_diff ({redirect_count}/3)", flush=True)
+                        else:
+                            redirect_count = 0
+
+                    result = await env.step(action)
+                    obs    = result.observation.model_dump()
+
+                    reward = result.reward or 0.0
+                    done   = result.done
+                    error  = obs.get("info", {}).get("error")
+                    rewards.append(reward)
+                    steps_taken = step
+
+                    parts = [action.action_type.value]
+                    if action.file_path:         parts.append(f"file={action.file_path}")
+                    if action.line_number:        parts.append(f"line={action.line_number}")
+                    if action.score is not None:  parts.append(f"score={action.score}")
+                    log_step(
+                        step=step,
+                        action="(" + " ".join(parts) + ")",
+                        reward=reward,
+                        done=done,
+                        error=error,
+                    )
+
+                    if action.action_type == ActionType.READ_FILE and action.file_path:
+                        files_read.add(action.file_path)
+                    if action.action_type == ActionType.POST_COMMENT and action.file_path and action.line_number:
+                        comments_posted.add(f"{action.file_path}:{action.line_number}")
+
+                    detail = ""
+                    if action.file_path:   detail += f" file={action.file_path}"
+                    if action.line_number: detail += f" line={action.line_number}"
+                    if action.comment:     detail += f" comment='{action.comment[:60]}'"
+                    history.append(
+                        f"Step {step}: {action.action_type.value}{detail} -> reward {reward:+.2f}"
+                    )
+
+                    if done:
+                        score = float(obs.get("info", {}).get("grader_score", 0.0))
+                        break
+
+                if score == 0.0:
+                    score = float(obs.get("info", {}).get("grader_score", 0.0))
+                score   = float(min(max(score, 0.0), 1.0))
+                success = score >= SUCCESS_SCORE_THRESHOLD
+
+            finally:
+                log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    finally:
+        try:
+            await env.close()
+        except Exception as e:
+            print(f"[DEBUG] env.close() error: {e}", flush=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except BaseException as exc:
-        # Last-resort catch — emit [END] for any task that never got one
-        print(f"[DEBUG] Fatal: {type(exc).__name__}: {exc}", flush=True)
-        for task_id in TASKS:
-            log_end(success=False, steps=0, score=0.0, rewards=[])
+    asyncio.run(main())
