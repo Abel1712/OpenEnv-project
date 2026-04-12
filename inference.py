@@ -289,15 +289,15 @@ async def run_task(client: OpenAI, task_id: str) -> None:
         score   = float(min(max(score, 0.0), 1.0))
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as exc:
-        print(f"[DEBUG] run_task({task_id}) error: {exc}", flush=True)
+    except BaseException as exc:
+        print(f"[DEBUG] run_task({task_id}) error: {type(exc).__name__}: {exc}", flush=True)
 
     finally:
         if env is not None:
             try:
                 await env.close()
-            except Exception as e:
-                print(f"[DEBUG] env.close() error: {e}", flush=True)
+            except BaseException as e:
+                print(f"[DEBUG] env.close() error: {type(e).__name__}: {e}", flush=True)
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
@@ -317,9 +317,17 @@ async def main() -> None:
     for task_id in TASKS:
         try:
             await run_task(client, task_id)
-        except Exception as exc:
-            print(f"[DEBUG] Unhandled error for {task_id}: {exc}", flush=True)
+        except BaseException as exc:
+            print(f"[DEBUG] Unhandled error for {task_id}: {type(exc).__name__}: {exc}", flush=True)
+            log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except BaseException as exc:
+        # Last-resort catch — emit [END] for any task that never got one
+        print(f"[DEBUG] Fatal: {type(exc).__name__}: {exc}", flush=True)
+        for task_id in TASKS:
+            log_end(success=False, steps=0, score=0.0, rewards=[])
