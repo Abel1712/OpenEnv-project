@@ -18,7 +18,6 @@ IMAGE_NAME   = os.getenv("LOCAL_IMAGE_NAME")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
-ENV_URL      = os.getenv("ENV_URL", "https://abeljames-code-review-env.hf.space")
 BENCHMARK    = "code-review-env"
 MAX_STEPS    = 20          # 3 tasks × 20 steps × ~10s/call ≈ 10 min — safely under 20 min limit
 TEMPERATURE  = 0.7
@@ -172,6 +171,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
     score   = 0.0
     success = False
     env     = None
+    redirect_count = 0
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
@@ -181,7 +181,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
         if IMAGE_NAME:
             env = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
         else:
-            env = CodeReviewEnvClient(base_url=ENV_URL)
+            raise RuntimeError("LOCAL_IMAGE_NAME not set — cannot connect to environment")
 
         result = await env.reset(episode_id=task_id)
         obs    = result.observation.model_dump()
@@ -203,16 +203,20 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             # Hard block: override premature assign_score in code, not just via prompt hint.
             # If the LLM ignores instructions and scores before doing any work, redirect it.
             if action.action_type == ActionType.ASSIGN_SCORE and step < MAX_STEPS:
-                if not files_read:
+                if redirect_count < 3 and not files_read:
                     # Haven't read any file yet — force read of first changed file
                     changed = obs.get("pr_metadata", {}).get("changed_files", [])
                     fallback_file = changed[0] if changed else None
                     action = Action(action_type=ActionType.READ_FILE, file_path=fallback_file)
-                    print(f"[DEBUG] Blocked premature assign_score (no files read); redirected to read_file {fallback_file}", flush=True)
-                elif not comments_posted:
+                    redirect_count += 1
+                    print(f"[DEBUG] Blocked premature assign_score (no files read); redirected to read_file {fallback_file} (redirect {redirect_count}/3)", flush=True)
+                elif redirect_count < 3 and not comments_posted:
                     # Read files but posted no comments yet — force get_diff to keep reviewing
                     action = Action(action_type=ActionType.GET_DIFF)
-                    print("[DEBUG] Blocked premature assign_score (no comments posted); redirected to get_diff", flush=True)
+                    redirect_count += 1
+                    print(f"[DEBUG] Blocked premature assign_score (no comments posted); redirected to get_diff (redirect {redirect_count}/3)", flush=True)
+                else:
+                    redirect_count = 0  # reset on pass-through
 
             result = await env.step(action)
             obs    = result.observation.model_dump()
@@ -224,7 +228,12 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             rewards.append(reward)
             steps_taken = step
 
-            log_step(step=step, action=action.action_type.value, reward=reward, done=done, error=error)
+            parts = [action.action_type.value]
+            if action.file_path:   parts.append(f"file={action.file_path}")
+            if action.line_number: parts.append(f"line={action.line_number}")
+            if action.score is not None: parts.append(f"score={action.score}")
+            action_str = "(" + " ".join(parts) + ")"
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
 
             if action.action_type == ActionType.READ_FILE and action.file_path:
                 files_read.add(action.file_path)
