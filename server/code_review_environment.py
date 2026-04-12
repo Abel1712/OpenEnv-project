@@ -163,13 +163,16 @@ class CodeReviewEnvironment(Environment[Action, Observation, CodeReviewState]):
                     and prev["text"] == action.comment):
                 return "Duplicate comment — already posted.", -0.10
 
+        # Compute reward BEFORE appending — reward.py's duplicate-check loop
+        # scans state.comments, so appending first would always trigger -0.10.
+        reward = compute_step_reward(action, self._state, "")
+
         self._state.comments.append({
             "file": action.file_path,
             "line": action.line_number,
             "text": action.comment,
         })
 
-        reward = compute_step_reward(action, self._state, "")
         return f"Comment posted on {action.file_path}:{action.line_number}", reward
 
     def _handle_check_lint(self, action: Action):
