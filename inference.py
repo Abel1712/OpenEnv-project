@@ -69,6 +69,13 @@ SYSTEM_PROMPT = textwrap.dedent("""
        issue on that specific line.
     4. assign_score — call this after posting all comments. Score guide:
        0-3: block merge (security/critical), 4-6: needs changes, 7-10: approve.
+       When assigning a score, include severity labels in your comments:
+       - CRITICAL for security vulnerabilities like SQL injection or unsafe deserialization
+       - HIGH for serious issues like path traversal
+       - MEDIUM for moderate issues like hardcoded secrets
+       - LOW for style/formatting issues
+       Also include fix keywords: use ">=" for off-by-one, "await" for race conditions, "null"
+       for null/undefined edge cases, parameterized queries for SQL injection.
 
     CRITICAL RULES:
     - Never read a file you have already read — check "Files already read" before read_file.
@@ -101,6 +108,17 @@ def build_user_prompt(
     else:
         urgency = ""
 
+    # Task-specific score guidance so the LLM picks the right range
+    task_id = obs.get("info", {}).get("task_id", "")
+    if task_id == "task_1":
+        score_guidance = "Score guidance for this task: give 5–8 (style issues — approve with suggestions)."
+    elif task_id == "task_2":
+        score_guidance = "Score guidance for this task: give ≤4 (logic bugs require changes/rejection)."
+    elif task_id == "task_3":
+        score_guidance = "Score guidance for this task: give EXACTLY 0 (security vulnerabilities must block merge)."
+    else:
+        score_guidance = ""
+
     # FIX 2: Raise truncation limit so model sees enough content to identify real line numbers
     action_result = obs.get('action_result', '')
     action_result_preview = action_result[:2500] if len(action_result) > 2500 else action_result
@@ -119,6 +137,7 @@ def build_user_prompt(
         Last action result:
         {action_result_preview}
         Review progress: {obs.get('review_progress', {})}
+        {score_guidance}
         Previous steps:
         {history_block}
         What is your next action?
@@ -180,6 +199,8 @@ async def run_task(client: OpenAI, task_id: str) -> None:
         # fall back to the hosted HF Space URL otherwise.
         if IMAGE_NAME:
             env = await CodeReviewEnvClient.from_docker_image(IMAGE_NAME)
+        elif os.getenv("ENV_URL"):
+            env = CodeReviewEnvClient(base_url=os.getenv("ENV_URL"))
         else:
             raise RuntimeError("LOCAL_IMAGE_NAME not set — cannot connect to environment")
 
@@ -190,11 +211,16 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             if result.done:
                 break
 
-            # Last step safety net: force assign_score so grader always runs
+            # Last step safety net: force assign_score so grader always runs.
+            # Scores are task-specific to trigger grader bonuses:
+            #   task_1: 6.0 (style — approve with suggestions, 5–8 range)
+            #   task_2: 3.0 (logic bugs — rejection bonus requires ≤4)
+            #   task_3: 0.0 (security — block bonus requires exactly 0)
+            _forced_scores = {"task_1": 6.0, "task_2": 3.0, "task_3": 0.0}
             if step == MAX_STEPS:
                 action = Action(
                     action_type=ActionType.ASSIGN_SCORE,
-                    score=5.0,
+                    score=_forced_scores.get(task_id, 5.0),
                     summary="Review complete — forced score at step limit",
                 )
             else:
